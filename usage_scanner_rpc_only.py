@@ -26,7 +26,7 @@ What it does:
 - Uses trace_filter(toAddress=[target]) over that range
 - Filters frames by function selector
 - Attributes counterparties as:
-    - internal call: action.from
+    - internal call: action.from (when action.from != tx.from)
     - direct top-level call: tx.from via eth_getTransactionByHash
 - Classifies counterparties as [EOA] / [Contract] / [7702del]
 - Prints:
@@ -52,12 +52,69 @@ from eth_utils import keccak, to_checksum_address
 
 
 EMPTY_CODES = {"0x", "0x0", "0x00", ""}
-PARITY_CALL_TYPES = {"call", "staticcall", "delegatecall", "callcode"}
 
 
 class RpcError(RuntimeError):
     pass
 
+
+# ---------------------------------------------------------------------------
+# Progress bar
+# ---------------------------------------------------------------------------
+
+class ProgressBar:
+    """
+    Simple terminal progress bar that prints to stderr so it does not
+    interfere with the script's stdout output.
+
+    Usage:
+        bar = ProgressBar(total=100, prefix="Scanning")
+        bar.update(10)   # advance by 10
+        bar.set(50)      # jump to 50
+        bar.finish()     # print newline and final state
+    """
+
+    BAR_WIDTH = 40
+
+    def __init__(self, total: int, prefix: str = "") -> None:
+        self.total = max(total, 1)
+        self.prefix = prefix
+        self._current = 0
+        self._render()
+
+    def _render(self) -> None:
+        pct = self._current / self.total
+        filled = int(self.BAR_WIDTH * pct)
+        bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
+        line = f"\r{self.prefix} [{bar}] {self._current}/{self.total} ({pct:.0%})"
+        print(line, end="", flush=True, file=sys.stderr)
+
+    def update(self, n: int = 1) -> None:
+        self._current = min(self._current + n, self.total)
+        self._render()
+
+    def set(self, value: int) -> None:
+        self._current = min(value, self.total)
+        self._render()
+
+    def set_prefix(self, prefix: str) -> None:
+        self.prefix = prefix
+        self._render()
+
+    def finish(self) -> None:
+        self._current = self.total
+        self._render()
+        print(file=sys.stderr)  # newline
+
+
+def status(msg: str) -> None:
+    """Print a one-line status message to stderr (no progress bar)."""
+    print(f"  {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing & helpers
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -69,8 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rpc-url", required=True, help="Tracing-enabled JSON-RPC endpoint")
     p.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
     p.add_argument("--avg-block-time", type=int, default=12, help="Fallback average block time in seconds")
-    p.add_argument("--chunk-size", type=int, default=50000, help="Blocks per trace_filter chunk")
-    p.add_argument("--full-address", action="store_true", help="Print full addresses instead of shortened form")
+    p.add_argument("--chunk-size", type=int, default=100, help="Blocks per trace_filter chunk")
+
     p.add_argument("--verbose-trace-errors", action="store_true", help="Print per-chunk trace errors to stderr")
     return p
 
@@ -85,12 +142,6 @@ def normalize_hex_address(addr: str) -> str:
 
 def function_selector(signature: str) -> str:
     return "0x" + keccak(text=signature)[:4].hex()
-
-
-def fmt_address(addr: str, full: bool) -> str:
-    if full:
-        return addr
-    return f"{addr[:6]}....{addr[-2:]}"
 
 
 def hex_to_int(x: str) -> int:
@@ -110,6 +161,10 @@ def classify_code(code: str) -> str:
     return "[Contract]"
 
 
+# ---------------------------------------------------------------------------
+# RPC primitives
+# ---------------------------------------------------------------------------
+
 def rpc_post(session: requests.Session, rpc_url: str, method: str, params: list, timeout: int) -> Any:
     payload = {
         "jsonrpc": "2.0",
@@ -125,17 +180,41 @@ def rpc_post(session: requests.Session, rpc_url: str, method: str, params: list,
     return data.get("result")
 
 
+def rpc_batch(
+    session: requests.Session,
+    rpc_url: str,
+    calls: List[Tuple[str, list]],
+    timeout: int,
+) -> List[Any]:
+    """
+    Execute a JSON-RPC batch request.
+
+    `calls` is a list of (method, params) tuples.
+    Returns a list of result values in the same order as `calls`.
+    Entries whose call returned an error are None.
+    """
+    payload = [
+        {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
+        for i, (method, params) in enumerate(calls)
+    ]
+    resp = session.post(rpc_url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    items = resp.json()
+    # Responses may arrive out of order; use id to reorder.
+    ordered = [None] * len(calls)
+    for item in items:
+        idx = item.get("id")
+        if idx is not None and 0 <= idx < len(ordered):
+            ordered[idx] = item.get("result")
+    return ordered
+
+
 def assert_trace_filter_supported(
     session: requests.Session,
     rpc_url: str,
     target_contract: str,
     timeout: int,
 ) -> None:
-    """
-    Verify that the RPC provider supports trace_filter.
-
-    Runs a minimal query over the latest block to test support.
-    """
     try:
         latest = rpc_post(session, rpc_url, "eth_blockNumber", [], timeout)
         if not isinstance(latest, str):
@@ -146,7 +225,6 @@ def assert_trace_filter_supported(
             "fromBlock": hex(latest_int),
             "toBlock": hex(latest_int),
             "toAddress": [target_contract],
-            "mode": "union",
         }]
 
         result = rpc_post(session, rpc_url, "trace_filter", params, timeout)
@@ -194,6 +272,10 @@ def eth_get_block_by_number(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Block range estimation
+# ---------------------------------------------------------------------------
+
 def estimate_start_block_by_avg_time(latest_block: int, days: int, avg_block_time: int) -> int:
     blocks_back = int((days * 24 * 60 * 60) / max(avg_block_time, 1))
     return max(0, latest_block - blocks_back)
@@ -207,9 +289,7 @@ def refine_start_block_by_timestamp(
     rough_start: int,
     timeout: int,
 ) -> int:
-    """
-    Binary search the first block with timestamp >= target_ts.
-    """
+    """Binary search the first block with timestamp >= target_ts."""
     lo = max(0, rough_start)
     hi = latest_block
 
@@ -230,6 +310,10 @@ def refine_start_block_by_timestamp(
     return lo
 
 
+# ---------------------------------------------------------------------------
+# Trace scanning
+# ---------------------------------------------------------------------------
+
 def trace_filter_chunk(
     session: requests.Session,
     rpc_url: str,
@@ -242,7 +326,6 @@ def trace_filter_chunk(
         "fromBlock": int_to_hex(from_block),
         "toBlock": int_to_hex(to_block),
         "toAddress": [target_contract],
-        "mode": "union",
     }]
     result = rpc_post(session, rpc_url, "trace_filter", params, timeout)
     if not isinstance(result, list):
@@ -250,18 +333,29 @@ def trace_filter_chunk(
     return result
 
 
-def eth_get_transaction_by_hash(
+def resolve_tx_froms_batch(
     session: requests.Session,
     rpc_url: str,
-    txhash: str,
+    txhashes: List[str],
+    cache: Dict[str, Optional[str]],
     timeout: int,
-) -> Optional[dict]:
-    result = rpc_post(session, rpc_url, "eth_getTransactionByHash", [txhash], timeout)
-    if result is None:
-        return None
-    if not isinstance(result, dict):
-        raise RpcError("eth_getTransactionByHash returned unexpected payload")
-    return result
+) -> None:
+    """
+    Fetch tx senders for all `txhashes` not already in `cache`, using a
+    single JSON-RPC batch request. Results are written into `cache` in-place.
+    """
+    missing = [h for h in txhashes if h not in cache]
+    if not missing:
+        return
+
+    calls = [("eth_getTransactionByHash", [h]) for h in missing]
+    results = rpc_batch(session, rpc_url, calls, timeout)
+
+    for txhash, tx in zip(missing, results):
+        if tx and isinstance(tx, dict):
+            cache[txhash] = tx.get("from")
+        else:
+            cache[txhash] = None
 
 
 def add_counterparty(counterparty_to_txs: Dict[str, Set[str]], counterparty: str, txhash: str) -> None:
@@ -294,12 +388,20 @@ def scan_via_trace_filter(
     selector_matches = 0
     failed_chunks = 0
 
-    current = start_block
     target_lc = target_contract.lower()
     selector_lc = selector.lower()
 
+    total_blocks = end_block - start_block + 1
+    total_chunks = max(1, (total_blocks + chunk_size - 1) // chunk_size)
+    bar = ProgressBar(total=total_chunks, prefix="Scanning blocks")
+
+    current = start_block
+    chunk_index = 0
+
     while current <= end_block:
         chunk_end = min(current + chunk_size - 1, end_block)
+        chunk_index += 1
+        bar.set_prefix(f"Scanning blocks {current}-{chunk_end}")
 
         try:
             traces = trace_filter_chunk(
@@ -314,11 +416,19 @@ def scan_via_trace_filter(
             failed_chunks += 1
             if verbose_trace_errors:
                 print(
-                    f"[trace_filter failed] blocks {current}-{chunk_end}: {e}",
+                    f"\n[trace_filter failed] blocks {current}-{chunk_end}: {e}",
                     file=sys.stderr,
                 )
+            bar.update(1)
             current = chunk_end + 1
             continue
+
+        # ---------------------------------------------------------------
+        # First pass: collect all selector-matching traces and gather the
+        # txhashes we need to resolve, then batch-fetch them all at once.
+        # ---------------------------------------------------------------
+        matching_traces = []
+        txhashes_needed: List[str] = []
 
         for tr in traces:
             if not isinstance(tr, dict):
@@ -326,17 +436,14 @@ def scan_via_trace_filter(
 
             frames_seen += 1
 
-            typ = (tr.get("type") or "").lower()
             action = tr.get("action") or {}
-            trace_address = tr.get("traceAddress", [])
             txhash = (tr.get("transactionHash") or "").lower()
-
             to_addr = (action.get("to") or "").lower()
-            frm = action.get("from") or ""
             inp = (action.get("input") or "").lower()
 
-            if typ not in PARITY_CALL_TYPES:
-                continue
+            # We drop the type/callType check entirely: every trace that
+            # reaches the target with the right selector is a usage,
+            # regardless of call variant (call, staticcall, delegatecall…).
             if to_addr != target_lc:
                 continue
             if not inp.startswith(selector_lc):
@@ -345,43 +452,83 @@ def scan_via_trace_filter(
                 continue
 
             selector_matches += 1
+            matching_traces.append(tr)
 
-            # Internal call: immediate caller is action.from
-            if isinstance(trace_address, list) and len(trace_address) > 0:
-                add_counterparty(hits, frm, txhash)
-                continue
-
-            # Top-level direct tx: use transaction sender
             if txhash not in tx_from_cache:
-                try:
-                    tx = eth_get_transaction_by_hash(session, rpc_url, txhash, timeout)
-                    tx_from_cache[txhash] = tx.get("from") if tx else None
-                except Exception:
-                    tx_from_cache[txhash] = None
+                txhashes_needed.append(txhash)
+
+        # Batch-resolve all tx senders needed for this chunk.
+        if txhashes_needed:
+            resolve_tx_froms_batch(session, rpc_url, txhashes_needed, tx_from_cache, timeout)
+
+        # ---------------------------------------------------------------
+        # Second pass: attribute each matching trace to a counterparty.
+        #
+        # The correct way to distinguish a direct call from an internal
+        # one is NOT traceAddress == [] (which is true for any root-level
+        # call, including contract-to-contract ones). Instead, compare
+        # action.from against the tx origin:
+        #   - If they match  → the tx sender called the function directly.
+        #   - If they differ → an intermediate contract (action.from) is
+        #                       the immediate caller we want to record.
+        # ---------------------------------------------------------------
+        for tr in matching_traces:
+            action = tr.get("action") or {}
+            txhash = (tr.get("transactionHash") or "").lower()
+            frm = action.get("from") or ""
 
             top_from = tx_from_cache.get(txhash)
-            if top_from and is_hex_address(top_from):
-                add_counterparty(hits, top_from, txhash)
 
+            is_direct = top_from and (top_from.lower() == frm.lower())
+
+            if is_direct:
+                add_counterparty(hits, top_from, txhash)
+            else:
+                # Internal call: record the immediate contract caller.
+                add_counterparty(hits, frm, txhash)
+
+        bar.update(1)
         current = chunk_end + 1
         time.sleep(0.05)
 
+    bar.finish()
     return hits, frames_seen, selector_matches, failed_chunks
 
 
-def classify_addresses(
+# ---------------------------------------------------------------------------
+# Address classification
+# ---------------------------------------------------------------------------
+
+def classify_addresses_batch(
     session: requests.Session,
     rpc_url: str,
     addresses: Iterable[str],
     timeout: int,
 ) -> Dict[str, str]:
+    """
+    Classify all addresses in a single JSON-RPC batch call.
+    """
+    addr_list = sorted(set(addresses), key=str.lower)
+    if not addr_list:
+        return {}
+
+    bar = ProgressBar(total=len(addr_list), prefix="Classifying addresses")
+
+    calls = [("eth_getCode", [addr, "latest"]) for addr in addr_list]
+    results = rpc_batch(session, rpc_url, calls, timeout)
+
     out: Dict[str, str] = {}
-    for addr in sorted(set(addresses), key=str.lower):
-        code = eth_get_code(session, rpc_url, addr, timeout)
-        out[addr] = classify_code(code)
-        time.sleep(0.02)
+    for addr, code in zip(addr_list, results):
+        out[addr] = classify_code(code or "0x")
+        bar.update(1)
+
+    bar.finish()
     return out
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     args = build_parser().parse_args()
@@ -401,8 +548,9 @@ def main() -> int:
     cutoff_ts = int(cutoff_dt.timestamp())
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "usage-scanner-rpc-only/1.1"})
+    session.headers.update({"User-Agent": "usage-scanner-rpc-only/1.2"})
 
+    status("Checking trace_filter support…")
     assert_trace_filter_supported(
         session=session,
         rpc_url=args.rpc_url,
@@ -410,8 +558,10 @@ def main() -> int:
         timeout=args.timeout,
     )
 
+    status("Verifying target has code…")
     assert_target_has_code(session, args.rpc_url, target_contract, args.timeout)
 
+    status("Resolving block range…")
     latest_block = eth_block_number(session, args.rpc_url, args.timeout)
     rough_start = estimate_start_block_by_avg_time(latest_block, args.days, args.avg_block_time)
     start_block = refine_start_block_by_timestamp(
@@ -422,6 +572,7 @@ def main() -> int:
         rough_start=rough_start,
         timeout=args.timeout,
     )
+    status(f"Block range: {start_block} → {latest_block}")
 
     hits, frames_seen, selector_matches, failed_chunks = scan_via_trace_filter(
         session=session,
@@ -435,7 +586,7 @@ def main() -> int:
         verbose_trace_errors=args.verbose_trace_errors,
     )
 
-    labels = classify_addresses(
+    labels = classify_addresses_batch(
         session=session,
         rpc_url=args.rpc_url,
         addresses=hits.keys(),
@@ -445,6 +596,10 @@ def main() -> int:
     total_matched_txs = sum(len(v) for v in hits.values())
     total_unique_counterparties = len(hits)
 
+    print()
+    print(f"#####################################")
+    print(f"############# RESULTS ###############")
+    print(f"#####################################")
     print(f"# Contract: {target_contract}")
     print(f"# Function signature: {args.signature}")
     print(f"# Selector: {selector}")
@@ -467,7 +622,7 @@ def main() -> int:
     rows.sort(key=lambda x: (-x[2], x[1].lower()))
 
     for label, addr, n in rows:
-        print(f"{label} {fmt_address(addr, args.full_address)} ({n} txs)")
+        print(f"{label} {addr} ({n} txs)")
 
     return 0
 
