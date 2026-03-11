@@ -2,21 +2,22 @@
 
 A lightweight Python script to analyze **who is calling a specific function on a smart contract** over the last *N days*, including **internal contract calls**.
 
-The scanner uses **trace RPC APIs** to detect both direct transactions and internal calls within the same transaction.
+The scanner uses **trace RPC APIs** to detect both direct transactions and internal calls, using JSON-RPC batch requests to minimise round-trips.
 
 ---
 
 # Features
 
-* Detects **direct and internal function calls**
+* Detects **direct and internal function calls** — including `staticcall` and `delegatecall` variants
 * Works without Etherscan or external indexers
 * Identifies **unique counterparties**
 * Classifies addresses as:
-
   * `[EOA]` — externally owned account
   * `[Contract]` — smart contract
   * `[7702del]` — EIP-7702 delegated account
 * Aggregates **number of transactions per caller**
+* Batches `eth_getTransactionByHash` and `eth_getCode` lookups for performance
+* Displays a **live progress bar** to stderr during scanning and classification
 
 ---
 
@@ -24,13 +25,10 @@ The scanner uses **trace RPC APIs** to detect both direct transactions and inter
 
 * Python **3.9+**
 * Dependencies:
-
 ```
 pip install requests eth-utils
 ```
-
 * An **RPC provider with tracing enabled** supporting:
-
 ```
 trace_filter
 eth_getCode
@@ -39,7 +37,6 @@ eth_getTransactionByHash
 ```
 
 Example providers that may support this:
-
 * Chainstack (Growth plan or higher)
 * Erigon / Nethermind self-hosted nodes
 * Some QuickNode trace-enabled endpoints
@@ -74,31 +71,34 @@ Optional parameters:
 | ------------------------ | -------------------------------------------------- |
 | `--chunk-size`           | Number of blocks per trace query (default `50000`) |
 | `--avg-block-time`       | Used for initial block estimation (default `12`)   |
-| `--timeout`              | RPC timeout seconds                                |
-| `--full-address`         | Print full addresses instead of shortened          |
-| `--verbose-trace-errors` | Show trace RPC errors                              |
+| `--timeout`              | RPC timeout seconds (default `30`)                 |
+| `--verbose-trace-errors` | Print per-chunk trace RPC errors to stderr         |
 
 ---
 
 # Output Format
+
+Progress and status messages are written to **stderr**. The final result is written to **stdout**, making it safe to redirect or pipe.
 
 Example output:
 
 ```
 # Contract: 0x32400084C286CF3E17e7B677ea9583e60a000324
 # Function signature: requestL2Transaction(address,uint256,bytes,uint256,uint256,bytes[],address)
-# Selector: 0xdd9a13f
+# Selector: 0xeb672419
 # Lookback days: 14
+# Cutoff UTC: 2026-02-25T10:00:00+00:00
 # Start block: 21938450
 # End block: 21972031
 # Trace frames seen: 421
 # Selector-matching frames: 23
+# trace_filter failed chunks: 0
 # Matched txs: 17
 # Unique counterparties: 6
 
-[EOA] 0x1234....ab (5 txs)
-[Contract] 0x98cd....ff (4 txs)
-[EOA] 0x77aa....12 (3 txs)
+[EOA] 0x1234567890abcdef1234567890abcdef12345678 (5 txs)
+[Contract] 0x98cdabcdef1234567890abcdef1234567890abcd (4 txs)
+[EOA] 0x77aabbccdd1234567890abcdef1234567890aabb (3 txs)
 ```
 
 Each result line shows:
@@ -108,14 +108,14 @@ Each result line shows:
 ```
 
 Where:
-
 * **TYPE**
+  * `[EOA]` — externally owned account
+  * `[Contract]` — smart contract
+  * `[7702del]` — EIP-7702 delegated account
+* **ADDRESS** — full checksummed address
+* **n txs** — number of **unique transactions** where that address was the immediate caller
 
-  * `[EOA]` externally owned account
-  * `[Contract]` smart contract
-  * `[7702del]` EIP-7702 delegated account
-
-* **n txs** = number of **unique transactions** where the address invoked the function.
+Results are sorted by transaction count descending.
 
 If the same address calls the function multiple times in the same transaction, it counts as **1 transaction**.
 
@@ -123,11 +123,12 @@ If the same address calls the function multiple times in the same transaction, i
 
 # Limitations
 
-* Requires RPC providers exposing **trace APIs (`trace_filter`)**.
-* Some RPC providers (Infura, Alchemy, Cloudflare) **do not support tracing**.
-* Very large time windows may require adjusting `--chunk-size`.
+* Requires an RPC provider exposing **`trace_filter`**.
+* Infura, Alchemy, and Cloudflare **do not support tracing**.
+* Very large time windows may require reducing `--chunk-size` to avoid RPC timeouts.
 * `(n txs)` counts **unique transactions**, not individual call frames.
-* The script assumes **Ethereum-style tracing APIs** (Erigon/OpenEthereum/Nethermind).
+* Assumes **Ethereum-style tracing APIs** (Erigon / OpenEthereum / Nethermind).
+* JSON-RPC batch support is required for the tx and code lookups — all major tracing nodes support this.
 
 ---
 
@@ -135,51 +136,25 @@ If the same address calls the function multiple times in the same transaction, i
 
 1. Verify RPC supports `trace_filter`
 2. Verify target address contains code
-3. Convert lookback days → block range
-4. Query traces using:
-
-```
-trace_filter(toAddress=[target_contract])
-```
-
-5. Filter frames where:
-
-```
-call.input.startswith(function_selector)
-```
-
-6. Attribute caller:
-
-   * **internal call** → `action.from`
-   * **direct tx** → `tx.from`
-7. Classify caller via `eth_getCode`
-8. Aggregate results by unique transaction hash
+3. Convert lookback days → exact block range via binary search on block timestamps
+4. Query traces in chunks using:
+   ```
+   trace_filter(toAddress=[target_contract])
+   ```
+5. For each chunk, filter frames where:
+   ```
+   action.input.startswith(function_selector)
+   ```
+   All call variants are included (call, staticcall, delegatecall, callcode).
+6. Batch-resolve tx senders for all matching frames in the chunk via a single `eth_getTransactionByHash` batch request
+7. Attribute each frame to the correct counterparty:
+   * If `action.from == tx.from` → **direct call**, record `tx.from`
+   * If `action.from != tx.from` → **internal call**, record `action.from` (the immediate caller)
+8. After scanning, batch-classify all counterparties via a single `eth_getCode` batch request
+9. Print results sorted by transaction count
 
 ---
 
 # License
 
 MIT
-
----
-
-
-
-python usage_scanner.py \
-  --address 0x32400084c286cf3e17e7b677ea9583e60a000324 \
-  --signature "requestL2Transaction(address,uint256,bytes,uint256[],address)" \
-  --days 14 \
-  --apikey N32PW1UV4GDD76ZC5199I8WUSGADM7D59F \
-  --rpc-url "https://ethereum-mainnet.core.chainstack.com/0c589fd97722cca4bc8b35ef7781b396" \
-  --chainid 1 \
-  --verbose-trace-errors 
- 
-python usage_scanner.py \
-  --address 0x32400084c286cf3e17e7b677ea9583e60a000324 \
-  --signature "finalizeEthWithdrawal(uint256,uint256,uint16,bytes,bytes32[])" \
-  --days 14 \
-  --apikey N32PW1UV4GDD76ZC5199I8WUSGADM7D59F \
-  --rpc-url "https://ethereum-mainnet.core.chainstack.com/0c589fd97722cca4bc8b35ef7781b396" \
-  --chainid 1 \
-  --verbose-trace-errors # on-chain-usage-scanner
-
