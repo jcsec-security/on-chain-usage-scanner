@@ -69,7 +69,7 @@ Optional parameters:
 
 | Flag                     | Description                                        |
 | ------------------------ | -------------------------------------------------- |
-| `--chunk-size`           | Number of blocks per trace query (default `50000`) |
+| `--chunk-size`           | Number of blocks per trace query (default `100`, Chainstack) |
 | `--avg-block-time`       | Used for initial block estimation (default `12`)   |
 | `--timeout`              | RPC timeout seconds (default `30`)                 |
 | `--verbose-trace-errors` | Print per-chunk trace RPC errors to stderr         |
