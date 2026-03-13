@@ -126,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rpc-url", required=True, help="Tracing-enabled JSON-RPC endpoint")
     p.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
     p.add_argument("--avg-block-time", type=int, default=12, help="Fallback average block time in seconds")
-    p.add_argument("--chunk-size", type=int, default=100, help="Blocks per trace_filter chunk")
+    p.add_argument("--chunk-size", type=int, default=1000, help="Blocks per trace_filter chunk")
 
     p.add_argument("--verbose-trace-errors", action="store_true", help="Print per-chunk trace errors to stderr")
     return p

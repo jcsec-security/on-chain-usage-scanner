@@ -8,8 +8,15 @@ What it does:
 - Collects candidate verified contract addresses
 - Fetches verified source via Etherscan V2 getsourcecode
 - Locates every occurrence of the search query in source, with filename and line number
-- Filters out contracts with fewer than X normal txs in the last Y months
+- Filters out contracts with fewer than X call traces in the last Y months
 - Prints matching contracts or writes CSV
+
+Tx counting via trace_filter (RPC):
+    Unlike Etherscan's txlist/txlistinternal APIs, trace_filter returns ALL
+    incoming call traces including zero-value delegatecalls.  This means
+    contracts deployed behind a proxy (which receive traffic exclusively as
+    zero-value delegatecalls) are counted correctly and not filtered out.
+    Requires a Chainstack archive node (or any node that exposes trace_filter).
 
 Requirements:
     pip install requests beautifulsoup4 python-dateutil tqdm
@@ -17,12 +24,14 @@ Requirements:
 Examples:
     python etherscan_smart_search_filter.py \\
       --apikey YOUR_KEY \\
+      --rpc-url https://YOUR_CHAINSTACK_ENDPOINT \\
       --query "finalizeEthWithdrawal" \\
       --min-txs 10 \\
       --months 6
 
     python etherscan_smart_search_filter.py \\
       --apikey YOUR_KEY \\
+      --rpc-url https://YOUR_CHAINSTACK_ENDPOINT \\
       --query "requestL2Transaction" \\
       --min-txs 5 \\
       --months 3 \\
@@ -63,7 +72,7 @@ ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api"
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 
 # ---------------------------------------------------------------------------
-# Token-bucket rate limiter (shared across all API calls)
+# Token-bucket rate limiter (shared across all Etherscan API calls)
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
@@ -133,9 +142,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keyword/function name to search in Smart Contract Search and locate in source",
     )
     p.add_argument("--min-txs", type=int, required=True,
-                   help="Minimum normal txs in the lookback window")
+                   help="Minimum call traces (direct + delegatecall) in the lookback window")
     p.add_argument("--months", type=int, required=True,
                    help="Lookback window in months")
+    p.add_argument(
+        "--rpc-url", default=None,
+        help=(
+            "Ethereum JSON-RPC endpoint that supports trace_filter "
+            "(e.g. a Chainstack archive node). Required when --min-txs > 0. "
+            "trace_filter counts all incoming call traces including zero-value "
+            "delegatecalls, so contracts behind proxies are counted correctly."
+        ),
+    )
     p.add_argument("--chainid", default="1",
                    help="Etherscan V2 chainid (default: 1)")
     p.add_argument("--max-pages", type=int, default=10,
@@ -362,90 +380,190 @@ def find_query_in_source(
 
 
 # ---------------------------------------------------------------------------
-# Tx count
+# Tx count via trace_filter (JSON-RPC)
 # ---------------------------------------------------------------------------
 
-def fetch_recent_normal_txs_count(
-    session: requests.Session,
+def _trace_filter_one_chunk(
+    rpc_url: str,
     address: str,
-    apikey: str,
-    chainid: str,
-    cutoff_ts: int,
+    from_block: int,
+    to_block: int,
     timeout: int,
-    start_block: Optional[int],
+    max_retries: int,
 ) -> int:
     """
-    Count normal transactions to `address` since `cutoff_ts`.
-
-    Uses `start_block` (derived from getblocknobytime) to avoid paginating
-    through the full tx history. Falls back to block 0 if start_block is None.
-    Stops before exceeding Etherscan's 10,000-result window cap.
+    Run trace_filter for a single block range chunk and return the trace count.
+    Paginates within the chunk using after/count.
     """
-    page = 1
-    offset = 1000
+    page_size = 200
+    after = 0
     count = 0
-    block_param = str(start_block) if start_block is not None else "0"
-    max_window = 10_000  # Etherscan hard cap: page × offset <= 10_000
+
+    from_block_hex = hex(from_block)
+    to_block_hex   = hex(to_block)
 
     while True:
-        if page * offset > max_window:
-            print(
-                f"  [warn] txlist for {address}: reached Etherscan 10,000-result "
-                f"window limit at page {page}; tx count may be a lower bound.",
-                file=sys.stderr,
-            )
-            break
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "trace_filter",
+            "params": [{
+                "toAddress": [address],
+                "fromBlock": from_block_hex,
+                "toBlock":   to_block_hex,
+                "after":     after,
+                "count":     page_size,
+            }],
+            "id": 1,
+        }
 
-        try:
-            data = etherscan_get(
-                session,
-                {
-                    "chainid": chainid,
-                    "module": "account",
-                    "action": "txlist",
-                    "address": address,
-                    "startblock": block_param,
-                    "endblock": "9999999999",
-                    "page": str(page),
-                    "offset": str(offset),
-                    "sort": "desc",
-                    "apikey": apikey,
-                },
-                timeout,
-            )
-        except EtherscanError as exc:
-            if "result window is too large" in str(exc).lower():
-                print(
-                    f"  [warn] txlist for {address}: result window too large "
-                    f"at page {page}; tx count may be a lower bound.",
-                    file=sys.stderr,
-                )
-                break
-            raise
-
-        result = data.get("result", [])
-        if isinstance(result, str) or not result:
-            break
-
-        reached_old = False
-        for tx in result:
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
             try:
-                ts = int(tx["timeStamp"])
-            except (KeyError, ValueError):
-                continue
+                resp = requests.post(rpc_url, json=payload, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as exc:
+                last_exc = exc
+                wait = 2 ** attempt
+                time.sleep(wait)
+        else:
+            raise RuntimeError(
+                f"trace_filter failed after {max_retries} attempts for {address}: {last_exc}"
+            )
 
-            if ts < cutoff_ts:
-                reached_old = True
-                break  # sorted desc — all subsequent are older
+        error = data.get("error")
+        if error:
+            raise RuntimeError(
+                f"trace_filter RPC error for {address}: {error.get('message', error)}"
+            )
 
-            count += 1
+        traces = data.get("result") or []
+        count += len(traces)
 
-        if reached_old or len(result) < offset:
+        if len(traces) < page_size:
             break
 
-        page += 1
+        after += page_size
 
     return count
+
+
+
+def fetch_trace_tx_count(
+    rpc_url: str,
+    address: str,
+    from_block: int,
+    to_block: int,
+    timeout: int,
+    max_retries: int = 4,
+    block_chunk_size: int = 1_000,
+    min_txs: int = 0,
+) -> int:
+    """
+    Count all incoming call traces to `address` between `from_block` and
+    `to_block` using the trace_filter JSON-RPC method.
+
+    trace_filter returns every call trace regardless of ETH value, including
+    zero-value delegatecalls. This means contracts deployed behind a proxy
+    (which receive no direct txs and no ETH-value internal calls, only
+    zero-value delegatecalls) are counted correctly.
+
+    Requires an archive node that exposes the trace_filter method
+    (e.g. Chainstack archive nodes, Erigon, OpenEthereum).
+
+    Splits the full block range into chunks of `block_chunk_size` to comply
+    with nodes that impose a per-call block range limit.
+
+    If `min_txs` > 0, stops as soon as the running count reaches that
+    threshold — there is no point scanning further once the filter is satisfied.
+    Returns the (partial) count in that case, which is >= min_txs.
+    """
+    total_blocks = to_block - from_block + 1
+    n_chunks = (total_blocks + block_chunk_size - 1) // block_chunk_size
+
+    count = 0
+    chunk_start = from_block
+
+    # Inner progress bar so per-contract scanning is visible
+    chunk_iter = range(n_chunks)
+    if tqdm and n_chunks > 1:
+        chunk_iter = tqdm(
+            chunk_iter,
+            desc=f"  {address[:10]}…",
+            unit="chunk",
+            leave=False,
+        )
+
+    for _ in chunk_iter:
+        chunk_end = min(chunk_start + block_chunk_size - 1, to_block)
+        count += _trace_filter_one_chunk(
+            rpc_url=rpc_url,
+            address=address,
+            from_block=chunk_start,
+            to_block=chunk_end,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        chunk_start = chunk_end + 1
+
+        # Early exit: already enough traces to pass the filter
+        if min_txs > 0 and count >= min_txs:
+            if tqdm and hasattr(chunk_iter, "close"):
+                chunk_iter.close()
+            break
+
+    return count
+
+
+def get_block_by_timestamp_rpc(
+    rpc_url: str,
+    timestamp: int,
+    timeout: int,
+) -> Optional[int]:
+    """
+    Binary-search for the block number closest to `timestamp` using
+    eth_getBlockByNumber via JSON-RPC.
+
+    Used as a fallback / complement to Etherscan's getblocknobytime so that
+    the from_block for trace_filter can be determined without an extra
+    Etherscan API call when rpc_url is available.
+    """
+    try:
+        # Get latest block number
+        resp = requests.post(
+            rpc_url,
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        latest = int(resp.json()["result"], 16)
+
+        lo, hi = 0, latest
+        while lo < hi:
+            mid = (lo + hi) // 2
+            resp = requests.post(
+                rpc_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBlockByNumber",
+                    "params": [hex(mid), False],
+                    "id": 1,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            block = resp.json().get("result") or {}
+            block_ts = int(block.get("timestamp", "0x0"), 16)
+
+            if block_ts < timestamp:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        return lo
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -505,19 +623,17 @@ def discover_addresses_via_smart_contract_search(
     timeout: int,
     page_delay: float,
     stop_after: int,
-) -> Tuple[List[str], Dict[str, str], str]:
+) -> Tuple[List[str], Dict[str, str]]:
     """
     Scrape Etherscan Smart Contract Search results and return discovered addresses.
 
     Returns:
       - unique addresses in discovery order
       - mapping of address (lowercased) -> discovery page URL
-      - param label for logging
     """
     all_addresses: List[str] = []
     address_to_url: Dict[str, str] = {}
     seen: set = set()
-    param_label = "q+a=all"
 
     for page_num in range(1, max_pages + 1):
         if page_num * 100 > 10_000:
@@ -553,14 +669,14 @@ def discover_addresses_via_smart_contract_search(
                 all_addresses.append(addr)
                 address_to_url[addr_l] = final_url
                 if stop_after and len(all_addresses) >= stop_after:
-                    return all_addresses, address_to_url, param_label
+                    return all_addresses, address_to_url
 
         print(f"  Page {page_num}: {len(page_addrs)} addresses found (total so far: {len(all_addresses)})", flush=True)
 
         if len(page_addrs) < 100:
             break
 
-    return all_addresses, address_to_url, param_label
+    return all_addresses, address_to_url
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +719,11 @@ def main() -> int:
         raise SystemExit("--min-txs must be >= 0")
     if args.max_pages <= 0:
         raise SystemExit("--max-pages must be > 0")
+    if args.min_txs > 0 and not args.rpc_url:
+        raise SystemExit(
+            "--rpc-url is required when --min-txs > 0. "
+            "Provide a Chainstack archive node endpoint that supports trace_filter."
+        )
 
     cutoff_dt = datetime.now(timezone.utc) - relativedelta(months=args.months)
     cutoff_ts = int(cutoff_dt.timestamp())
@@ -611,7 +732,7 @@ def main() -> int:
     session.headers.update({"User-Agent": "etherscan-contract-search-scanner/2.0"})
 
     # ---- Discovery ----------------------------------------------------------
-    discovered, address_to_url, param_used = discover_addresses_via_smart_contract_search(
+    discovered, address_to_url = discover_addresses_via_smart_contract_search(
         session=session,
         query=args.query,
         max_pages=args.max_pages,
@@ -629,22 +750,40 @@ def main() -> int:
         )
 
     print(f"# Smart Contract Search query : {args.query}")
-    print(f"# Discovery param used        : {param_used}")
     print(f"# Candidate addresses         : {len(discovered)}")
 
-    # ---- Pre-fetch start block for tx window --------------------------------
-    start_block: Optional[int] = None
-    if args.months > 0:
-        start_block = get_block_by_timestamp(
+    # ---- Resolve from_block for trace_filter window -------------------------
+    from_block = 0
+    if args.months > 0 and args.rpc_url:
+        # Try Etherscan first (fast), fall back to RPC binary search
+        from_block = get_block_by_timestamp(
             session, cutoff_ts, args.apikey, args.chainid, args.timeout
-        )
-        if start_block:
-            print(f"# Tx window start block       : {start_block:,}")
+        ) or get_block_by_timestamp_rpc(
+            args.rpc_url, cutoff_ts, args.timeout
+        ) or 0
+        if from_block:
+            print(f"# Trace window from block     : {from_block:,}")
         else:
             print(
-                "# [warn] getblocknobytime failed; falling back to full history scan",
+                "# [warn] could not resolve start block; scanning full history",
                 file=sys.stderr,
             )
+
+    # Get current block for to_block bound
+    to_block = 99_999_999
+    if args.rpc_url:
+        try:
+            resp = requests.post(
+                args.rpc_url,
+                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                timeout=args.timeout,
+            )
+            to_block = int(resp.json()["result"], 16)
+            print(f"# Trace window to block       : {to_block:,}")
+        except Exception:
+            pass
+
+    block_chunk_size = 1_000
 
     # ---- Per-contract filtering ---------------------------------------------
     matches: List[MatchRow] = []
@@ -689,30 +828,28 @@ def main() -> int:
 
         with_query_match += 1
 
-        # Tx count
-        try:
-            recent_tx_count = fetch_recent_normal_txs_count(
-                session=session,
-                address=address,
-                apikey=args.apikey,
-                chainid=args.chainid,
-                cutoff_ts=cutoff_ts,
-                timeout=args.timeout,
-                start_block=start_block,
-            )
-        except EtherscanError as e:
-            err_str = str(e).lower()
-            if "no transactions found" in err_str or "result=[]" in err_str:
-                recent_tx_count = 0
-            else:
-                print(f"[warn] tx count fetch failed for {address}: {e}", file=sys.stderr)
+        # Tx count via trace_filter — counts all incoming call traces including
+        # zero-value delegatecalls, so contracts behind proxies are not penalised.
+        if args.rpc_url:
+            try:
+                recent_tx_count = fetch_trace_tx_count(
+                    rpc_url=args.rpc_url,
+                    address=address,
+                    from_block=from_block,
+                    to_block=to_block,
+                    timeout=args.timeout,
+                    block_chunk_size=block_chunk_size,
+                    min_txs=args.min_txs,
+                )
+            except Exception as e:
+                print(f"[warn] trace_filter failed for {address}: {e}", file=sys.stderr)
                 continue
-        except Exception as e:
-            print(f"[warn] tx count fetch failed for {address}: {e}", file=sys.stderr)
-            continue
 
-        if recent_tx_count < args.min_txs:
-            continue
+            if recent_tx_count < args.min_txs:
+                continue
+        else:
+            # --min-txs 0 with no rpc_url: skip counting entirely
+            recent_tx_count = 0
 
         matches.append(MatchRow(
             address=address,
