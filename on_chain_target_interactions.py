@@ -121,7 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="RPC-only scanner for counterparties calling a target function directly or internally."
     )
     p.add_argument("--address", required=True, help="Target contract address")
-    p.add_argument("--signature", required=True, help='Canonical signature, e.g. "transfer(address,uint256)"')
+    p.add_argument(
+        "--signature",
+        required=False,
+        default=None,
+        help='Canonical signature, e.g. "transfer(address,uint256)". Omit to match any selector.',
+    )
     p.add_argument("--days", required=True, type=int, help="Lookback window in days")
     p.add_argument("--rpc-url", required=True, help="Tracing-enabled JSON-RPC endpoint")
     p.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
@@ -368,7 +373,7 @@ def scan_via_trace_filter(
     session: requests.Session,
     rpc_url: str,
     target_contract: str,
-    selector: str,
+    selector: Optional[str],
     start_block: int,
     end_block: int,
     chunk_size: int,
@@ -381,6 +386,9 @@ def scan_via_trace_filter(
       - frames_seen
       - selector_matches
       - failed_chunks
+
+    If `selector` is None, every trace reaching the target is counted
+    (no selector filtering is performed).
     """
     hits: Dict[str, Set[str]] = defaultdict(set)
     tx_from_cache: Dict[str, Optional[str]] = {}
@@ -389,7 +397,7 @@ def scan_via_trace_filter(
     failed_chunks = 0
 
     target_lc = target_contract.lower()
-    selector_lc = selector.lower()
+    selector_lc = selector.lower() if selector is not None else None
 
     total_blocks = end_block - start_block + 1
     total_chunks = max(1, (total_blocks + chunk_size - 1) // chunk_size)
@@ -446,7 +454,7 @@ def scan_via_trace_filter(
             # regardless of call variant (call, staticcall, delegatecall…).
             if to_addr != target_lc:
                 continue
-            if not inp.startswith(selector_lc):
+            if selector_lc is not None and not inp.startswith(selector_lc):
                 continue
             if not txhash:
                 continue
@@ -541,7 +549,7 @@ def main() -> int:
         raise SystemExit(f"Invalid target address: {args.address}")
 
     target_contract = normalize_hex_address(args.address)
-    selector = function_selector(args.signature)
+    selector = function_selector(args.signature) if args.signature else None
 
     now_dt = datetime.now(timezone.utc)
     cutoff_dt = now_dt - timedelta(days=args.days)
@@ -601,8 +609,8 @@ def main() -> int:
     print(f"############# RESULTS ###############")
     print(f"#####################################")
     print(f"# Contract: {target_contract}")
-    print(f"# Function signature: {args.signature}")
-    print(f"# Selector: {selector}")
+    print(f"# Function signature: {args.signature if args.signature else '<any>'}")
+    print(f"# Selector: {selector if selector else '<any>'}")
     print(f"# Lookback days: {args.days}")
     print(f"# Cutoff UTC: {cutoff_dt.isoformat()}")
     print(f"# Start block: {start_block}")

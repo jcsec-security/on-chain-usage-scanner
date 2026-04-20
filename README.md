@@ -91,8 +91,8 @@ The script operates in three internal phases:
 python etherscan_verified_contracts_search.py \
   --apikey YOUR_ETHERSCAN_API_KEY \
   --query "requestL2Transaction" \
-  --min-txs 5 \
-  --months 3
+  --min-txs 10 \
+  --months 6
 ```
 
 **All arguments:**
@@ -150,8 +150,8 @@ python github_code_search.py \
 ```bash
 python github_code_search.py \
   --query "(finalizeEthWithdrawal OR requestL2Transaction) language:Solidity" \
-  --min-stars 50 \
-  --min-activity 90d \
+  --min-stars 10 \
+  --min-activity 180d \
   --token YOUR_GITHUB_TOKEN
 ```
 
