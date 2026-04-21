@@ -1,17 +1,4 @@
-"""
-Account/code classification: EOA vs Contract vs EIP-7702 delegation.
-
-NOTE ON EIP-7702:
-  EIP-7702 (active on mainnet) lets an EOA temporarily delegate its code to
-  a contract. These accounts store a magic prefix `0xef0100` followed by the
-  implementation address. We classify them separately as `[7702del]` so
-  callers can distinguish them from "true" contracts with arbitrary runtime
-  bytecode.
-
-LIMITATION: An address flagged `[Contract]` today may have been an EOA
-yesterday (the classification is a `latest` snapshot). If historical
-distinction matters, read code at the specific block.
-"""
+"""Account/code classification: [EOA] / [Contract] / [7702del]."""
 
 from __future__ import annotations
 
@@ -28,12 +15,12 @@ EMPTY_CODES = {"0x", "0x0", "0x00", ""}
 def classify_code(code: str) -> str:
     """
     Classify a hex-string result from eth_getCode:
-        "[EOA]"       : empty code (plain externally owned account)
-        "[7702del]"   : EIP-7702 delegation marker (EOA pointing to a contract)
-        "[Contract]"  : any other bytecode
+      "[EOA]"      empty code
+      "[7702del]"  EIP-7702 delegation marker (starts with 0xef0100)
+      "[Contract]" any other bytecode
 
-    The input is expected to be the raw hex string from eth_getCode (with or
-    without "0x" prefix, case-insensitive).
+    Reflects the current "latest" snapshot only. An account that's a
+    contract today may have been an EOA earlier.
     """
     code_lc = (code or "").lower()
     if code_lc in EMPTY_CODES:

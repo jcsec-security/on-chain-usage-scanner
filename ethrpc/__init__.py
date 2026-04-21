@@ -1,24 +1,18 @@
 """
-Shared Ethereum JSON-RPC helpers for find_address_refs.py and
+Shared Ethereum JSON-RPC helpers used by find_address_refs.py and
 on_chain_target_interactions.py.
 
-This module is deliberately small and dependency-light (only `requests`).
-It wraps JSON-RPC primitives, block-range resolution, trace_filter helpers,
-and bytecode/account classification.
+Contents:
+  client.py  — session, rpc_post, rpc_batch, RpcError, hex helpers
+  blocks.py  — latest_block, get_block_by_number, resolve_window
+               (binary-searches the block-timestamp boundary)
+  traces.py  — trace_filter probe, chunked scans, unique-tx counter,
+               tx-sender batch resolver
+  codes.py   — classify_code: EOA / Contract / EIP-7702 delegation
 
-LIMITATIONS (common to both callers):
-  * Mainnet-oriented defaults (12s avg block time, standard RPC semantics).
-    Adapting to other chains requires updating avg_block_time and any
-    chain-specific assumptions at the call sites.
-  * `trace_filter` is not a standard JSON-RPC method; it's an Erigon /
-    OpenEthereum extension. Call assert_trace_filter_supported() at the
-    start of any trace-based scan so the failure happens up front rather
-    than mid-scan.
-  * No retry logic. A transient network error propagates as an exception
-    — callers can wrap with their own retry policy if needed.
-  * No pagination inside trace_filter_chunk: if a single chunk returns
-    too much data for your provider, shrink the chunk size at the call
-    site rather than inside the helper.
+Only dependency is `requests`. Callers provide timeouts and concurrency;
+no retry logic is built in. `trace_filter` is an Erigon/OpenEthereum
+extension — call assert_trace_filter_supported() before scanning.
 """
 from .client import (
     RpcError,

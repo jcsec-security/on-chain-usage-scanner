@@ -77,28 +77,16 @@ def count_unique_txs_per_target(
 ) -> tuple[dict[str, set[str]], int]:
     """
     Scan trace_filter over [from_block, to_block] with toAddress=targets,
-    chunked by `chunk_size` blocks. Counts unique transaction hashes per
-    target — both direct (external) and internal calls that reach the
-    target contribute.
+    chunked by `chunk_size` blocks. Counts UNIQUE tx hashes per target —
+    both direct and internal calls contribute, a tx that hits the target
+    N times counts once.
 
-    Returns (tx_map, failed_chunks) where tx_map[target_lowercase] = set
-    of unique transaction hashes.
+    Returns (tx_map, failed_chunks) where tx_map[target_lowercase] is the
+    set of unique tx hashes. Failed chunks are counted; their block ranges
+    contribute zero rather than raising — callers should surface the count.
 
-    KEY SEMANTICS:
-    * UNIQUE txs, not frames. A tx that hits a target 100 times via
-      internal calls counts as ONE.
-    * Scan is over a FIXED block range snapshot. Transactions mined
-      AFTER from_block..to_block was captured are not included.
-    * Failed chunks are counted but not retried. A persistent failure
-      in a chunk means candidates whose txs land mostly there will be
-      undercounted with no warning other than the failed_chunks count.
-
-    PARALLELISM (`workers` > 1):
-    * Runs chunks concurrently through a thread pool.
-    * Trace providers vary in concurrency tolerance; on Chainstack
-      tracing tier 4-6 workers is usually safe, Erigon can handle more.
-    * If you see rate-limit errors, drop workers to 1 first, then try
-      smaller chunk_size.
+    workers > 1 runs chunks concurrently. on_chunk, if provided, is called
+    once per completed chunk with (idx, total, from, to, running_txs, failed).
     """
     target_set = {t.lower() for t in targets}
     if not target_set:

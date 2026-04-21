@@ -1,157 +1,17 @@
 """
 Find contracts on Ethereum mainnet that reference a specific target address.
 
-PIPELINE STAGES
-===============
-1. Dune SQL queries (4 sources, run in parallel):
-     - bytecode      : target bytes appear in a contract's creation code
-                       (catches `address constant`, `immutable`, and
-                       constructor arguments).
-     - tx_input      : target (padded to 32 bytes) appears anywhere in the
-                       calldata of a tx sent to the contract (catches
-                       externally-triggered setters and configuration calls).
-     - trace_input   : target appears in the input of an internal call to
-                       the contract (catches factory-initialized contracts
-                       and proxies/routers passing the address along).
-     - event_log     : target appears as an indexed topic or in non-indexed
-                       data of an event emitted by the contract.
+Runs a three-stage pipeline:
+  1. Discovery via four parallel Dune queries (bytecode, tx input, internal
+     traces, event logs), tagged by source.
+  2. Optional activity filter via trace_filter on a tracing-enabled RPC.
+  3. Storage verification (default on) via eth_getStorageAt.
 
-2. Activity filter (opt-in, via --min-txs):
-     Counts unique transactions (direct + internal) that hit each candidate
-     in the last --window-days days, by scanning `trace_filter` on a
-     tracing-enabled RPC. Drops candidates below --min-txs.
+Output is one CSV per source plus a merged CSV when multiple sources run.
 
-3. Storage verification (DEFAULT ON; --no-verify to disable):
-     Reads storage slots 0..--verify-slots-1 of each candidate via
-     eth_getStorageAt and checks whether the target's 20-byte pattern
-     appears anywhere in the 32-byte slot value. Drops candidates whose
-     current storage doesn't hold the address — with the "bytecode-only
-     exemption" documented below.
-
-WHAT IT FINDS (high-signal matches)
-===================================
-* Contracts with the target hardcoded as `address constant` or
-  `immutable` (compiled into runtime bytecode).
-* Contracts deployed with the target as a constructor argument.
-* Contracts with a setter function called externally OR from another
-  contract, passing the target address as an argument.
-* Contracts that emitted an event containing the target address. This is
-  typical of admin/owner/oracle/router setters.
-* Contracts that currently store the target address in one of the first
-  --verify-slots storage slots (default 50).
-
-WHAT IT MISSES (known false negatives)
-======================================
-* References older than 365 days in tx_input / trace_input / event_log.
-  The SQL queries are bounded to keep scans tractable on Dune's free
-  tier. The bytecode query is NOT time-bounded, so ancient deploys with
-  hardcoded references are still caught.
-
-* Addresses stored in Solidity mappings: `mapping(anything => address)`.
-  A mapping entry's slot is keccak256(key . baseSlot), which is outside
-  the linear 0..--verify-slots range. The storage verify step cannot
-  reach them. If your target lives in mappings across many contracts,
-  run with --no-verify.
-
-* Addresses stored in structs or dynamic arrays past slot
-  (--verify-slots - 1). Raise --verify-slots if the target protocol uses
-  large state layouts; the cost is linear in slots × candidates.
-
-* Proxy implementation addresses at EIP-1967 slots. These live at
-    - impl  = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
-    - admin = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103
-  far outside 0..50. A proxy that delegates to the target implementation
-  will NOT match the linear slot scan. Use a proxy-aware tool (Etherscan,
-  proxy detectors) if this case matters.
-
-* Contracts that obfuscate the address (XOR with a constant, hash-derived
-  lookups, sum of two stored halves, etc.). The bytecode scan matches
-  only the raw 20-byte literal; encoded references pass through undetected.
-
-* Addresses passed only via ERC-20/721/1155 standard functions.
-  We exclude these 4-byte selectors from tx_input and trace_input:
-      0xa9059cbb transfer(address,uint256)
-      0x23b872dd transferFrom(address,address,uint256)
-      0x095ea7b3 approve(address,uint256)
-      0xa22cb465 setApprovalForAll(address,bool)
-      0x42842e0e safeTransferFrom(address,address,uint256)
-      0xb88d4fde safeTransferFrom(address,address,uint256,bytes)
-      0xf242432a safeTransferFrom(address,address,uint256,uint256,bytes)
-      0x2eb2c2d6 safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)
-  NOTE: ERC-20 allowances to the target ARE technically stored in state
-  (the allowances mapping), but we treat these as counterparty noise, not
-  integration references. If you specifically want contracts that granted
-  approval to the target, remove 0x095ea7b3 from the SQL exclusion list.
-
-* Standard token events excluded from event_log (same reasoning):
-      Transfer, Approval, ApprovalForAll, TransferSingle, TransferBatch
-
-* permit() (EIP-2612) is NOT filtered — the spender address will appear
-  in tx_input and event_log hits. Depending on your use case this may be
-  noise (per-user approval) or signal (protocol-level integration).
-
-WHAT MAY BE OVER-INCLUDED (known false positives)
-=================================================
-* Raw 20-byte coincidental matches in bytecode. Probability ~1 in 2^160 —
-  effectively zero, but technically nonzero.
-
-* Contracts that once wrote the target address to storage and later
-  overwrote it to zero. The Dune queries surface historical writes.
-  With --verify on (default), these are caught and dropped. With
-  --no-verify, they remain in output.
-
-* Addresses packed into a storage slot with other data. The storage check
-  matches the 20-byte pattern anywhere in the 32-byte slot, so the slot
-  index in the CSV may correspond to a packed field rather than the
-  "conceptual" address variable.
-
-* Heavy integrations of the target address (e.g., WETH, USDC) will
-  produce large result sets. Use --min-txs to focus on actively-used
-  contracts and/or narrow --sources to just bytecode for a cleaner
-  "baked-in reference" view.
-
-BYTECODE-ONLY EXEMPTION
-=======================
-A candidate whose ONLY Dune signal is the bytecode source is exempt
-from the storage verification step and kept in output with
-`storage_slots_matched = exempt`.
-
-Rationale: `address constant` and `immutable` declarations are patched
-by solc into the runtime bytecode at deploy time and NEVER enter the
-storage trie. eth_getStorageAt cannot find them at any slot. Without
-this exemption, the default storage filter would reliably drop these
-correctly-identified contracts.
-
-Trade-offs in the exemption logic:
-* Lenient: constructor arguments stored to state at slot >= --verify-slots
-  are also bytecode-only and exempted, even though a larger --verify-slots
-  would have found them. We err toward inclusion.
-* Strict when multi-sourced: a contract appearing in bytecode AND any
-  runtime source (tx_input / trace_input / event_log) is NOT bytecode-only
-  and gets verified. This correctly handles constructor args stored in
-  state variables that then emit a setter event.
-
-REQUIREMENTS AND ENV VARS
-=========================
-DUNE_API_KEY           : Dune Analytics API key (paid plan recommended
-                         for any non-trivial scan volume).
-ETH_RPC_URL            : Ethereum mainnet RPC URL.
-                         - For --verify (default on): any RPC that supports
-                           eth_getStorageAt (Alchemy, QuickNode, Infura…).
-                         - For --min-txs > 0: must additionally support
-                           trace_filter (Erigon / OpenEthereum /
-                           Chainstack tracing tier / Alchemy trace add-on).
-
-Saved Dune queries: four queries per dune_queries.sql, accepting
-{{target_address_raw}} and {{target_address_padded}} parameters. Put
-their IDs in DEFAULT_QUERY_IDS below or pass via --query-* CLI flags.
-
-OUT OF SCOPE
-============
-* Non-mainnet chains. SQL uses `ethereum.*` tables and Etherscan URLs
-  point at etherscan.io. Adapting requires changing both.
-* Historical state queries. Storage verify reads "latest" only.
-* Arbitrary string matching. This tool is specific to 20-byte addresses.
+See README.md for the full pipeline description, known limitations (time
+bounds, mappings, proxies, ERC-20 filtering), required environment, and
+the bytecode-only exemption rationale.
 """
 
 from __future__ import annotations
@@ -175,15 +35,12 @@ EXECUTION_TIMEOUT_S = 30 * 60
 
 ALL_SOURCES = ("bytecode", "tx_input", "trace_input", "event_log")
 
-# ---------------------------------------------------------------------------
-# Default Dune query IDs — EDIT THESE to match your saved queries.
-# Set to 0 for any source you haven't saved yet; --query-* CLI flags override.
-# ---------------------------------------------------------------------------
+# Saved Dune query IDs; missing IDs only error out for sources you select.
 DEFAULT_QUERY_IDS: dict[str, int] = {
-    "bytecode":    0,   # e.g. 1234567
-    "tx_input":    0,
-    "trace_input": 0,
-    "event_log":   0,
+    "bytecode":    7349915,
+    "tx_input":    7349946,
+    "trace_input": 7349915,
+    "event_log":   7349970,
 }
 
 
@@ -356,29 +213,13 @@ def filter_by_activity(
     trace_workers: int = 1,
 ) -> set[str]:
     """
-    Count unique transactions hitting each contract in the last `window_days`
-    via trace_filter, and return the subset meeting `min_txs`.
+    Return the subset of `contracts` that received >= `min_txs` unique
+    transactions in the last `window_days`, counting direct and internal
+    calls uniformly.
 
-    Counts BOTH direct (external) and internal calls uniformly: any trace
-    frame whose `action.to` equals the contract contributes its tx hash.
-    The metric is `len(set(tx_hashes))` per contract — a tx that hits the
-    contract via 100 internal calls counts as ONE.
-
-    Caveats:
-    * Requires a tracing-enabled RPC (Erigon/OpenEthereum-compatible).
-      Standard RPC providers without a trace tier will fail the pre-flight
-      check and abort before scanning.
-    * The block range is determined once at the start of this function. A
-      long-running scan will not update its cutoff as time passes; txs that
-      land AFTER the function started are NOT counted.
-    * Failed `trace_filter` chunks (timeouts, oversized responses) are
-      logged and skipped. A candidate whose txs land mostly inside a
-      failed chunk will have an undercount. Lower --chunk-size if you see
-      frequent failures.
-    * `toAddress=[all candidates]` is sent in a single trace_filter call
-      per chunk. Providers have varying limits; if you have thousands of
-      candidates, consider post-filtering some out before reaching this
-      step (e.g., with --sources bytecode).
+    Uses trace_filter (requires a tracing-enabled RPC). Counts UNIQUE tx
+    hashes per contract — a tx that hits the contract 100 times via
+    internal calls counts as one.
     """
     if not contracts:
         return set()
@@ -441,13 +282,7 @@ def filter_by_activity(
 def rpc_get_storage_at(
     session, rpc_url: str, contract: str, slot: int,
 ) -> str:
-    """
-    Wrapper around eth_getStorageAt returning a lowercase hex string.
-
-    Reads at block "latest" — this is always CURRENT state, not historical.
-    A contract that once stored the target and later cleared it returns
-    zeroes here.
-    """
+    """Read a storage slot at block 'latest' and return it as lowercase hex."""
     val = rpc_post(
         session, rpc_url, "eth_getStorageAt",
         [contract, hex(slot), "latest"], 15,
@@ -465,26 +300,12 @@ def verify_storage(
     workers: int = 8,
 ) -> dict[str, list[int]]:
     """
-    For each contract, read slots [0, slots_to_scan) and check whether the
-    target's raw 20-byte hex appears anywhere inside each 32-byte slot value.
+    For each contract, read slots [0, slots_to_scan) and return
+    {contract -> [slots where the 20-byte target appears in the 32-byte value]}.
 
-    Returns {contract_lowercase -> [slot indices where the pattern matched]}.
-
-    Limitations:
-    * Only scans the LINEAR slot range 0..slots_to_scan-1. Misses:
-        - Addresses in mappings (slot = keccak256(key . baseSlot))
-        - Addresses in structs/arrays past slots_to_scan-1
-        - Addresses at EIP-1967 proxy slots (very high hashed slots)
-      Callers should be aware that a negative result ≠ "address not
-      stored"; it means "not found in the first N linear slots".
-    * Uses "latest" — current state only.
-    * Substring match within the 32-byte slot value, so:
-        - Correctly catches packed-slot addresses.
-        - May report a slot index that's shared with other packed fields;
-          the slot contains the address but may not be "conceptually" an
-          address-typed variable.
-    * Total RPC calls = len(contracts) × slots_to_scan. On a free tier
-      RPC this can hit rate limits for large candidate lists.
+    Contracts with no matches are OMITTED from the returned dict. Only
+    scans the linear slot range — mapping entries and far-offset structs
+    require adjusting `slots_to_scan` or a different approach (see README).
     """
     target_hex = target_raw[2:]
     session = make_session("find-address-refs/1.0")
@@ -523,13 +344,11 @@ def _format_storage_cell(
     verified_targets: set[str],
 ) -> str:
     """
-    Render the storage_slots_matched CSV cell.
-
-    Preference order:
-      1. 'exempt'     — bytecode-only contract, skipped by design
-      2. 'N,N,...'    — storage slots where the address was found
-      3. 'unchecked'  — not sent to verify (only possible with --verify-top)
-      4. ''           — should not appear, means filtered out earlier
+    Render the storage_slots_matched CSV cell. Precedence:
+      'exempt'    if bytecode-only
+      'N,N,...'   if slots matched
+      'unchecked' if not sent to verify (--verify-top truncation)
+      ''          otherwise (shouldn't appear — would indicate a filter bug)
     """
     if contract in bytecode_only:
         return "exempt"
@@ -739,28 +558,13 @@ def main() -> None:
     print(f"target address: {raw}")
     print(f"running sources: {list(query_ids.keys())}\n")
 
-    # -----------------------------------------------------------------
-    # STAGE 1: Dune queries (parallel, one per selected source)
-    # -----------------------------------------------------------------
-    # Each source uses a DIFFERENT Dune table and catches a different kind
-    # of reference — see module-level docstring for details. Queries 2, 3,
-    # and 4 are time-bounded to the last 365 days inside the SQL to keep
-    # Dune scan cost manageable. The bytecode query is UNBOUNDED, so old
-    # deploys with hardcoded references are still caught. ERC-20/721/1155
-    # standard selectors and topic0s are excluded at the SQL level.
+    # --- Stage 1: Dune discovery (parallel, one call per source) ---
     by_source = run_queries(dune_key, query_ids, raw, padded)
     total = sum(len(h) for h in by_source.values())
     unique = {h.contract_address for hits in by_source.values() for h in hits}
     print(f"\ntotal raw hits: {total}, unique contracts: {len(unique)}\n")
 
-    # -----------------------------------------------------------------
-    # STAGE 2: activity filter (opt-in via --min-txs)
-    # -----------------------------------------------------------------
-    # Drops candidates with fewer than --min-txs unique transactions in
-    # the last --window-days days. Counts BOTH direct (external) and
-    # internal calls uniformly via trace_filter — a single trace frame
-    # reaching the contract contributes its tx hash, which is deduped
-    # per contract. Requires a tracing-enabled RPC.
+    # --- Stage 2: activity filter (optional, via --min-txs) ---
     kept_contracts: set[str] | None = None
     if args.min_txs > 0 and unique:
         kept_contracts = filter_by_activity(
@@ -775,36 +579,19 @@ def main() -> None:
         )
         print()
 
-    # -----------------------------------------------------------------
-    # STAGE 3: storage verification (default ON — see --no-verify to skip)
-    # -----------------------------------------------------------------
-    # The verify stage reads the first N storage slots of each candidate
-    # and keeps only those where the target's 20-byte pattern appears.
-    # This drops historical references that were later overwritten, and
-    # removes raw-bytecode false positives where the address appears in
-    # creation code but was never stored in state.
-    #
-    # CAVEAT: The linear slot scan cannot see mapping entries, deep
-    # struct fields, or EIP-1967 proxy slots. If your target is expected
-    # to live in any of those, run with --no-verify. See module-level
-    # docstring ("WHAT IT MISSES") for the full list.
-    #
-    # BYTECODE-ONLY EXEMPTION: contracts whose ONLY Dune signal was the
-    # bytecode source are skipped here — the address they match is
-    # typically a constant/immutable in runtime bytecode, not storage.
-    # They're kept in the output marked as `exempt`. See module-level
-    # docstring ("BYTECODE-ONLY EXEMPTION") for the rationale.
+    # --- Stage 3: storage verification (default on, --no-verify to skip) ---
     storage_matches: dict[str, list[int]] | None = None
     verified_targets: set[str] = set()
     bytecode_only: set[str] = set()
 
     if args.verify:
-        # Build a per-contract source set to detect bytecode-only candidates.
-        # A contract is bytecode-only iff its source set == {"bytecode"}.
-        # Multi-source contracts (bytecode + any runtime source) are NOT
-        # bytecode-only and get verified normally — this is correct because
-        # a runtime signal (tx/trace/event) typically means the address was
-        # actually written to state at some point.
+        # Bytecode-only candidates (sole signal = bytecode source) are exempt
+        # from the storage check. Rationale: `address constant` and `immutable`
+        # declarations are patched into RUNTIME BYTECODE at deploy time, not
+        # storage, so eth_getStorageAt would always miss them and the default
+        # filter would drop correctly-identified contracts. A contract that
+        # shows up in bytecode AND any runtime source is NOT bytecode-only
+        # and gets verified normally.
         source_map: dict[str, set[str]] = {}
         for src, hits in by_source.items():
             for h in hits:
@@ -814,10 +601,6 @@ def main() -> None:
         pool = sorted(kept_contracts) if kept_contracts is not None else sorted(unique)
         verify_list = [c for c in pool if c not in bytecode_only]
         if args.verify_top > 0:
-            # Truncating the verify list means contracts past the cutoff
-            # are marked `unchecked` (not `no_match`), i.e. we cannot make
-            # a positive or negative claim about them. They're kept in the
-            # output regardless.
             verify_list = verify_list[:args.verify_top]
         verified_targets = set(verify_list)
 
@@ -832,13 +615,8 @@ def main() -> None:
             if verify_list else {}
         )
 
-        # Final filter composition:
-        #   kept = (in bytecode_only)      -> exempt, unconditionally kept
-        #        ∪ (in storage_matches)    -> storage-confirmed, kept
-        #        ∪ (not in verified_targets) -> unchecked due to verify-top,
-        #                                       kept since we have no signal
-        # Contracts that WERE checked and returned no matches are the ones
-        # silently removed here — that's the whole point of the stage.
+        # Final kept set: exempt ∪ matched ∪ unchecked (outside --verify-top).
+        # Contracts that WERE checked and had no match are the ones dropped.
         base = set(pool)
         kept_contracts = {
             c for c in base
@@ -854,19 +632,7 @@ def main() -> None:
         )
         print()
 
-    # -----------------------------------------------------------------
-    # STAGE 4: write outputs
-    # -----------------------------------------------------------------
-    # One CSV per source (named results_<source>.csv), plus a merged
-    # results_merged.csv if more than one source ran. The merged file
-    # aggregates by contract_address and ranks contracts by source count
-    # (how many independent signals they triggered).
-    #
-    # The `storage_slots_matched` column is present only if --verify was
-    # on. Values:
-    #   "exempt"     : bytecode-only, not checked
-    #   "3,7"        : checked and found at slots 3 and 7
-    #   "unchecked"  : was outside --verify-top, not checked (no claim made)
+    # --- Stage 4: write CSVs (one per source, plus merged if >1 source) ---
     print("writing CSVs:")
     for source, hits in by_source.items():
         write_per_source_csv(

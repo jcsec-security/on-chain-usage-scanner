@@ -1,58 +1,16 @@
 #!/usr/bin/env python3
 """
-RPC-only usage scanner for direct + internal calls to a target function.
+Scan a target contract for all counterparties that called a specific
+function on it — direct and internal — in the last N days, using
+trace_filter on a tracing-enabled JSON-RPC endpoint.
 
-PURPOSE
--------
-Given a contract address and (optionally) a function signature, list every
-unique counterparty that has called that function on the contract over the
-last N days, whether as a direct tx.from or via an internal call from
-another contract.
+Counterparties are ranked by unique tx count and classified as
+[EOA] / [Contract] / [7702del] via eth_getCode.
+
+See README.md for usage, arguments, tips, and limitations.
 
 Requirements:
     pip install requests eth-utils 'eth-hash[pycryptodome]'
-
-Usage:
-    python on_chain_target_interactions.py \\
-        --address 0xYourContract \\
-        --signature "requestL2Transaction(address,uint256,bytes,uint256,uint256,bytes[],address)" \\
-        --days 14 \\
-        --rpc-url https://your-tracing-rpc.example
-
-What it does:
-* Verifies the RPC provider supports trace_filter (Erigon/OpenEthereum style).
-* Verifies the target address has code via eth_getCode.
-* Computes a block range for the last N days (binary search on timestamps).
-* Uses trace_filter(toAddress=[target]) over that range, chunked.
-* Filters frames by function selector (first 4 bytes of action.input).
-* Attributes each matching frame to a counterparty:
-    - direct call:    tx.from (resolved via eth_getTransactionByHash)
-    - internal call:  action.from
-* Classifies counterparties as [EOA] / [Contract] / [7702del] via eth_getCode.
-
-LIMITATIONS / FALSE NEGATIVES
------------------------------
-* Time-bounded by --days only. Requires a tracing-enabled RPC that retains
-  enough history for the window.
-* Selector must match exactly. A contract calling the target via a wrapper
-  function (different selector) will not register against the --signature.
-  Drop --signature to see all callers of any function on the contract.
-* Delegatecall semantics: we count frames by action.to matching the target.
-  A delegatecall FROM the target to another contract is not a "call to the
-  target" and is correctly not counted. A delegatecall TO the target (rare
-  in practice) would be counted.
-* Failed trace_filter chunks are logged and skipped. Counterparties whose
-  txs land only in failed chunks are undercounted without precise warning.
-
-OUTPUT
-------
-Prints a ranked list like:
-    [Contract] 0xabc....ff (n txs)
-    [EOA]      0x123....aa (n txs)
-    [7702del]  0x456....11 (n txs)
-
-`n txs` = number of UNIQUE transaction hashes per counterparty (a tx that
-hits the target 10 times internally counts once).
 """
 
 from __future__ import annotations
