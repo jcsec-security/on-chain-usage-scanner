@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import sys
 from collections import defaultdict
 from typing import Callable, Iterable, Iterator
 
@@ -123,12 +124,22 @@ def _scan_sequential(
 ) -> tuple[dict[str, set[str]], int]:
     failed = 0
     total = len(chunks)
+    first_errors: list[str] = []
     for i, (a, b) in enumerate(chunks, 1):
         try:
             traces = trace_filter_chunk(session, rpc_url, a, b, list(target_set), timeout)
             _absorb_traces(traces, target_set, tx_per_target)
-        except Exception:
+        except Exception as e:
             failed += 1
+            # Log first 3 failures with the exception class and message so the
+            # user can see WHY chunks are failing, not just that they are.
+            if len(first_errors) < 3:
+                msg = f"  chunk {i} (blocks {a}-{b}) failed: {type(e).__name__}: {e}"
+                print(msg, file=sys.stderr)
+                first_errors.append(msg)
+            elif len(first_errors) == 3:
+                print("  (further chunk errors suppressed)", file=sys.stderr)
+                first_errors.append("...")  # sentinel so we don't print again
         if on_chunk:
             running = sum(len(v) for v in tx_per_target.values())
             on_chunk(i, total, a, b, running, failed)
@@ -140,21 +151,29 @@ def _scan_parallel(
 ) -> tuple[dict[str, set[str]], int]:
     failed = 0
     total = len(chunks)
+    first_errors: list[str] = []
 
-    def scan_one(idx: int, a: int, b: int) -> tuple[int, int, int, list | None]:
+    def scan_one(idx: int, a: int, b: int) -> tuple[int, int, int, list | None, str | None]:
         try:
             traces = trace_filter_chunk(session, rpc_url, a, b, list(target_set), timeout)
-            return idx, a, b, traces
-        except Exception:
-            return idx, a, b, None
+            return idx, a, b, traces, None
+        except Exception as e:
+            return idx, a, b, None, f"{type(e).__name__}: {e}"
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(scan_one, i, a, b) for i, (a, b) in enumerate(chunks, 1)]
         for fut in concurrent.futures.as_completed(futures):
-            idx, a, b, traces = fut.result()
+            idx, a, b, traces, err = fut.result()
             if traces is None:
                 failed += 1
+                if err and len(first_errors) < 3:
+                    msg = f"  chunk {idx} (blocks {a}-{b}) failed: {err}"
+                    print(msg, file=sys.stderr)
+                    first_errors.append(msg)
+                elif len(first_errors) == 3:
+                    print("  (further chunk errors suppressed)", file=sys.stderr)
+                    first_errors.append("...")
             else:
                 _absorb_traces(traces, target_set, tx_per_target)
             done += 1

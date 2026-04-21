@@ -1,0 +1,13 @@
+# Pipeline-wide
+requests
+
+# Step 1 (on_chain_target_interactions.py) + Step 4 (find_address_refs.py)
+eth-utils
+eth-hash[pycryptodome]
+
+# Step 2 (etherscan_verified_contracts_search.py)
+beautifulsoup4
+python-dateutil
+tqdm
+
+# Step 3 (github_code_search.py) — only uses requests + stdlib

@@ -4,22 +4,39 @@ A set of four scripts to systematically research the real-world usage of a contr
 
 Steps 1–3 focus on **function-level** research (who invokes a specific function). Step 4 addresses **contract-level** research (which contracts reference a specific address in their bytecode, state, or events).
 
+Run the four steps in order to build a comprehensive picture of who depends on the deprecation target:
+
 ```
-Step 1 — Who calls the function on-chain?         on_chain_target_interactions.py
-Step 2 — Who has integrated it in verified code?  etherscan_verified_contracts_search.py
-Step 3 — Who references it on GitHub?             github_code_search.py
-Step 4 — Which contracts reference an address?    find_address_refs.py
+Step 1  →  Identify active on-chain callers of the function (EOAs and contracts)
+            on_chain_target_interactions.py
+Step 2  →  From the contracts found, confirm which are verified integrators
+            and cross-reference with contracts not already in Step 1 results
+            etherscan_verified_contracts_search.py
+Step 3  →  Surface off-chain tooling, SDKs, and upcoming integrations
+            not yet visible on-chain
+            github_code_search.py
+Step 4  →  If the deprecation target is a CONTRACT ADDRESS (not just a
+            function), find every deployed contract that references it
+            in bytecode, state, or events — independent of whether the
+            reference is currently in use
+            find_address_refs.py
 ```
+
+The output of Step 1 (a list of counterparty addresses) can inform the `--query` used in Step 2. The results of Step 2 (verified contract addresses and names) can inform GitHub search terms used in Step 3. Step 4 works independently of the others but pairs well with Step 1: a contract found to reference the target address in Step 4 can be run through Step 1 to see whether it's actively being called on-chain.
+
 
 ---
 
 ## Requirements
 
 ```bash
-pip install requests eth-utils "eth-hash[pycryptodome]" beautifulsoup4 python-dateutil tqdm
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-`curl` must also be available in `PATH` (standard on macOS and Linux).
+`curl` must also be available in `PATH`.
 
 Additional per-script requirements are noted in each section below.
 
@@ -284,23 +301,3 @@ Full per-query details and rationale are in the module-level docstring of `find_
 ## Shared module: `ethrpc/`
 
 A small internal package used by Steps 1 and 4. It wraps Ethereum JSON-RPC primitives, block-range resolution with timestamp-accurate binary search, `trace_filter` support detection and chunked scanning, and bytecode/account classification (`[EOA]` / `[Contract]` / `[7702del]`). It has no dependencies beyond `requests`. You do not run it directly; it's imported by the two scripts that need it.
-
----
-
-## Suggested Workflow
-
-Run the four steps in order to build a comprehensive picture of who depends on the deprecation target:
-
-```
-Step 1  →  Identify active on-chain callers of the function (EOAs and contracts)
-Step 2  →  From the contracts found, confirm which are verified integrators
-            and cross-reference with contracts not already in Step 1 results
-Step 3  →  Surface off-chain tooling, SDKs, and upcoming integrations
-            not yet visible on-chain
-Step 4  →  If the deprecation target is a CONTRACT ADDRESS (not just a
-            function), find every deployed contract that references it
-            in bytecode, state, or events — independent of whether the
-            reference is currently in use
-```
-
-The output of Step 1 (a list of counterparty addresses) can inform the `--query` used in Step 2. The results of Step 2 (verified contract addresses and names) can inform GitHub search terms used in Step 3. Step 4 works independently of the others but pairs well with Step 1: a contract found to reference the target address in Step 4 can be run through Step 1 to see whether it's actively being called on-chain.

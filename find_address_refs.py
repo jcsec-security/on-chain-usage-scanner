@@ -35,11 +35,13 @@ EXECUTION_TIMEOUT_S = 30 * 60
 
 ALL_SOURCES = ("bytecode", "tx_input", "trace_input", "event_log")
 
-# Saved Dune query IDs; missing IDs only error out for sources you select.
+# Saved Dune query IDs — edit these after creating the queries, or pass
+# them per-invocation via --query-* CLI flags. Set to 0 for any source
+# you haven't saved; missing IDs only error out for sources you select.
 DEFAULT_QUERY_IDS: dict[str, int] = {
     "bytecode":    7349915,
     "tx_input":    7349946,
-    "trace_input": 7349915,
+    "trace_input": 7349959,
     "event_log":   7349970,
 }
 
@@ -149,6 +151,40 @@ class Hit:
 # Query orchestration
 # ---------------------------------------------------------------------------
 
+# Which parameter(s) each saved query declares on Dune. We send only
+# these per query — Dune's API rejects extras with HTTP 400.
+QUERY_PARAMS: dict[str, tuple[str, ...]] = {
+    "bytecode":    ("target_address_raw",),
+    "tx_input":    ("target_address_padded",),
+    "trace_input": ("target_address_padded",),
+    "event_log":   ("target_address_padded",),
+}
+
+
+_HEX_CHARS = set("0123456789abcdef")
+
+
+def _clean_hex_address(raw: object) -> str | None:
+    """
+    Normalize an address value coming out of Dune into `0x<40 lowercase hex>`.
+    Returns None if the value can't be coerced into a valid address —
+    callers should filter these out before sending to downstream RPCs.
+    Dune occasionally emits bytea as \\x... or with padding/whitespace that
+    blows up RPC JSON parsers.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s.startswith("\\x"):      # Dune bytea form
+        s = "0x" + s[2:]
+    if not s.startswith("0x"):
+        s = "0x" + s
+    body = s[2:]
+    if len(body) != 40 or not all(c in _HEX_CHARS for c in body):
+        return None
+    return s
+
+
 def run_queries(
     dune_key: str,
     query_ids: dict[str, int],
@@ -156,22 +192,27 @@ def run_queries(
     target_padded: str,
 ) -> dict[str, list[Hit]]:
     """Runs selected queries in parallel. Returns source -> list of Hits."""
-    params = {"target_address_raw": target_raw, "target_address_padded": target_padded}
+    all_params = {"target_address_raw": target_raw, "target_address_padded": target_padded}
     dune = DuneClient(dune_key)
 
     def run_one(source: str, qid: int) -> tuple[str, list[Hit]]:
         print(f"[{source}] executing query {qid}...", flush=True)
         t0 = time.time()
+        params = {k: all_params[k] for k in QUERY_PARAMS.get(source, all_params.keys())}
         rows = dune.run(qid, params)
         print(f"[{source}] {len(rows)} rows in {time.time() - t0:.1f}s", flush=True)
-        hits = [
-            Hit(
-                source=source,
-                contract_address=str(r["contract_address"]).lower(),
-                tx_hash=str(r["tx_hash"]).lower(),
-            )
-            for r in rows
-        ]
+        hits: list[Hit] = []
+        dropped = 0
+        for r in rows:
+            addr = _clean_hex_address(r.get("contract_address"))
+            txh = str(r.get("tx_hash") or "").strip().lower()
+            if addr is None or not txh:
+                dropped += 1
+                continue
+            hits.append(Hit(source=source, contract_address=addr, tx_hash=txh))
+        if dropped:
+            print(f"[{source}] dropped {dropped} row(s) with malformed address/tx_hash",
+                  file=sys.stderr)
         return source, hits
 
     by_source: dict[str, list[Hit]] = {s: [] for s in query_ids}
@@ -223,6 +264,29 @@ def filter_by_activity(
     """
     if not contracts:
         return set()
+
+    # Defense-in-depth: normalize + dedup before sending to trace_filter.
+    # Chainstack (and other providers) reject the entire batch with
+    # "invalid string length" if ANY address in the toAddress array is
+    # malformed, so one bad entry poisons every chunk.
+    clean: list[str] = []
+    seen: set[str] = set()
+    dropped = 0
+    for c in contracts:
+        a = _clean_hex_address(c)
+        if a is None:
+            dropped += 1
+            continue
+        if a in seen:
+            continue
+        seen.add(a)
+        clean.append(a)
+    if dropped:
+        print(f"filter_by_activity: dropped {dropped} malformed address(es) "
+              f"before trace_filter", file=sys.stderr)
+    if not clean:
+        return set()
+    contracts = clean
 
     session = make_session("find-address-refs/1.0")
 
@@ -650,3 +714,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
