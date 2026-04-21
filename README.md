@@ -1,11 +1,14 @@
-# Deprecated Function Usage Research Toolkit
+# Deprecated Function & Contract Usage Research Toolkit
 
-A set of three scripts to systematically research the real-world usage of a contract or specific functions that are planned for deprecation. The three steps are designed to be run in sequence, each answering a different dimension of the research question.
+A set of four scripts to systematically research the real-world usage of a contract, an address, or specific functions that are planned for deprecation. Each step answers a different dimension of the research question.
+
+Steps 1–3 focus on **function-level** research (who invokes a specific function). Step 4 addresses **contract-level** research (which contracts reference a specific address in their bytecode, state, or events).
 
 ```
-Step 1 — Who calls it on-chain?          on_chain_target_interactions.py
-Step 2 — Who has integrated it in code?  etherscan_verified_contracts_search.py
-Step 3 — Who references it on GitHub?    github_code_search.py
+Step 1 — Who calls the function on-chain?         on_chain_target_interactions.py
+Step 2 — Who has integrated it in verified code?  etherscan_verified_contracts_search.py
+Step 3 — Who references it on GitHub?             github_code_search.py
+Step 4 — Which contracts reference an address?    find_address_refs.py
 ```
 
 ---
@@ -13,7 +16,7 @@ Step 3 — Who references it on GitHub?    github_code_search.py
 ## Requirements
 
 ```bash
-pip install requests eth-utils beautifulsoup4 python-dateutil tqdm
+pip install requests eth-utils "eth-hash[pycryptodome]" beautifulsoup4 python-dateutil tqdm
 ```
 
 `curl` must also be available in `PATH` (standard on macOS and Linux).
@@ -35,6 +38,8 @@ For each unique counterparty found, it reports:
 
 The block range is resolved automatically from the `--days` argument using a binary-search refinement on block timestamps.
 
+The low-level RPC primitives and trace helpers live in the shared `ethrpc/` package, also used by Step 4.
+
 ### Usage
 
 ```bash
@@ -50,7 +55,7 @@ python on_chain_target_interactions.py \
 | Argument | Required | Description |
 |---|---|---|
 | `--address` | ✅ | Target contract address |
-| `--signature` | ✅ | Canonical function signature (used to derive the 4-byte selector) |
+| `--signature` | — | Canonical function signature (used to derive the 4-byte selector). Omit to match any selector |
 | `--days` | ✅ | Lookback window in days |
 | `--rpc-url` | ✅ | Tracing-enabled JSON-RPC endpoint |
 | `--chunk-size` | — | Blocks per `trace_filter` chunk (default: 1000) |
@@ -183,16 +188,119 @@ python github_code_search.py \
 
 ---
 
+## Step 4 — Contracts Referencing a Target Address: `find_address_refs.py`
+
+### Description
+
+Finds deployed contracts on Ethereum mainnet that reference a specific target address anywhere — either hardcoded in their bytecode (`address constant`, `immutable`, constructor arguments), passed into them via setter functions (externally or internally), or emitted in events. Designed for the case where the deprecation target is an entire contract address rather than a specific function.
+
+The script runs a three-stage pipeline:
+
+1. **Discovery** — Four parallel SQL queries on Dune Analytics (templates in `dune_queries.sql`) scan Ethereum's creation traces, transactions, internal traces, and event logs for any encoding of the target address. Each match is tagged with its source.
+
+2. **Activity filter** (opt-in) — Counts unique transactions (direct + internal) hitting each candidate over the last N days via `trace_filter` on a tracing-enabled RPC, and drops candidates below `--min-txs`. Uses the same `ethrpc` primitives as Step 1.
+
+3. **Storage verification** (default on) — Reads each candidate's first 50 storage slots via `eth_getStorageAt` and drops contracts that don't currently hold the address at any checked slot. Contracts whose *only* signal was the bytecode scan are exempt — `address constant` and `immutable` declarations live in runtime bytecode rather than storage, so the check would reliably misfire on them.
+
+Output is one CSV per selected source plus a merged `results_merged.csv`, with optional Etherscan URL columns for easy spot-checking.
+
+### Setup
+
+1. Save each of the four queries in `dune_queries.sql` as a separate saved query on Dune Analytics. Each accepts two text parameters: `target_address_raw` and `target_address_padded`.
+2. Copy each saved query's ID from its URL and edit the `DEFAULT_QUERY_IDS` dict at the top of `find_address_refs.py` (or pass them via `--query-*` CLI flags per-invocation).
+
+### Usage
+
+```bash
+python find_address_refs.py 0x57891966931Eb4Bb6FB81430E6cE0A03AAbDe063 \
+  --dune-api-key YOUR_DUNE_KEY \
+  --rpc-url https://your-tracing-rpc.example \
+  --etherscan-links \
+  --min-txs 10 --window-days 30 \
+  --out-dir ./results
+```
+
+**All arguments:**
+
+| Argument | Required | Description |
+|---|---|---|
+| `address` (positional) | ✅ | Target address to search for (0x-prefixed, 20 bytes) |
+| `--dune-api-key` | ✅ | Dune Analytics API key (or set `DUNE_API_KEY` env var) |
+| `--rpc-url` | ✅ when `--verify` or `--min-txs` > 0 | Ethereum RPC URL (or set `ETH_RPC_URL` env var). Needs a TRACING RPC for `--min-txs` |
+| `--sources` | — | Subset of `bytecode,tx_input,trace_input,event_log`, or `all` (default) |
+| `--query-bytecode` / `--query-tx` / `--query-trace` / `--query-log` | — | Dune saved-query IDs; override the `DEFAULT_QUERY_IDS` dict |
+| `--out-dir` | — | Directory for output CSVs (default: current dir) |
+| `--etherscan-links` | — | Add clickable Etherscan URL columns to CSV output |
+| `--min-txs` | — | Activity filter threshold in the window (default: 0 = filter disabled) |
+| `--window-days` | — | Activity window in days (default: 30) |
+| `--chunk-size` | — | Blocks per `trace_filter` chunk (default: 1000) |
+| `--trace-workers` | — | Parallel `trace_filter` chunks (default: 1; raise on tolerant providers) |
+| `--avg-block-time` | — | Seconds per block for initial range estimate (default: 12) |
+| `--trace-timeout` | — | Per-RPC-call timeout in seconds (default: 60) |
+| `--verify` / `--no-verify` | — | Storage verification step (default: on) |
+| `--verify-slots` | — | Slots per contract scanned by verify (default: 50) |
+| `--verify-top` | — | Verify only the top N candidates (0 = all passing filter) |
+
+### Output
+
+One CSV per selected source (`results_bytecode.csv`, `results_tx_input.csv`, `results_trace_input.csv`, `results_event_log.csv`), plus `results_merged.csv` when more than one source ran. Each row contains:
+
+- `source` — which query surfaced the hit
+- `contract_address` — the contract holding/referencing the target
+- `tx_hash` — a sample transaction (deploy tx for bytecode hits, setter tx for others)
+- `etherscan_contract`, `etherscan_tx` — optional URL columns (with `--etherscan-links`)
+- `storage_slots_matched` — only when `--verify` is on:
+  - `exempt`: bytecode-only candidate, not checked
+  - `3,7`: slot indices where the address was found
+  - `unchecked`: outside `--verify-top` window
+
+The merged CSV additionally has `sources` (pipe-separated list) and `source_count`, and is sorted by source count descending — contracts appearing in more independent sources rank higher.
+
+### Tips
+
+- Start with `--sources bytecode` to see the strongest-signal "hardcoded reference" set cheaply, before committing Dune credits on the heavier queries.
+- For popular target addresses (oracles, canonical tokens, well-known routers), use `--min-txs` to focus on actively-used integrators.
+- If the target is typically stored in a `mapping(... => address)`, the linear storage verification will always miss it. Run with `--no-verify` to keep all candidates regardless.
+- Use `--trace-workers 4` (or higher) to speed up the activity filter on providers that tolerate concurrent trace requests (Chainstack tracing tier, Erigon).
+- For exact per-slot details on a small candidate list, rerun with `--verify-slots 200` to widen the storage scan.
+
+### Limitations
+
+- **Dune cost**: queries 2-4 scan 365 days of Ethereum `transactions`, `traces`, and `logs`. Running the full pipeline against a popular address can consume a meaningful fraction of a monthly Dune credit allowance. Query 1 (bytecode) is the cheapest and unbounded in time.
+- **365-day time bound** on the runtime queries (tx, trace, event). References older than one year are invisible in those sources. The bytecode query has no time bound.
+- **Mappings are invisible** to the linear storage scan. If the target is stored in `mapping(... => address)` across candidates, use `--no-verify`.
+- **Proxy implementation addresses** at EIP-1967 slots (`impl` = `0x360894…`, `admin` = `0xb53127…`) are far outside the default 50-slot range. Proxies pointing at the target implementation will be dropped by verify unless `--no-verify` is used or `--verify-slots` is set absurdly high.
+- **ERC-20/721/1155 standard functions excluded**: `transfer`, `approve`, `setApprovalForAll`, and the various `safeTransferFrom` variants are filtered out at the SQL level as counterparty noise. ERC-20 allowances to the target address are therefore treated as noise, not integration signal. Edit `dune_queries.sql` to include them if that's relevant.
+- **Standard token events excluded** at the SQL level for the same reason: `Transfer`, `Approval`, `ApprovalForAll`, `TransferSingle`, `TransferBatch`.
+- **Obfuscated references don't match**: XOR'd, hash-derived, or split-stored addresses pass through the bytecode scan undetected.
+- **Activity filter requires a tracing RPC** (Erigon / OpenEthereum / Chainstack tracing tier / Alchemy trace add-on). Standard RPC is sufficient only for `--verify`.
+- **Mainnet only**: SQL uses the `ethereum.*` tables; Etherscan URLs point at `etherscan.io`. Adapting to other chains requires updating both.
+- **`storage_slots_matched` is a "latest"-state check**. A contract that once stored the address and later cleared it is correctly filtered out, but the annotation is not a historical audit.
+
+Full per-query details and rationale are in the module-level docstring of `find_address_refs.py` and the header of `dune_queries.sql`.
+
+---
+
+## Shared module: `ethrpc/`
+
+A small internal package used by Steps 1 and 4. It wraps Ethereum JSON-RPC primitives, block-range resolution with timestamp-accurate binary search, `trace_filter` support detection and chunked scanning, and bytecode/account classification (`[EOA]` / `[Contract]` / `[7702del]`). It has no dependencies beyond `requests`. You do not run it directly; it's imported by the two scripts that need it.
+
+---
+
 ## Suggested Workflow
 
-Run the three steps in order to build a comprehensive picture of who depends on the function being deprecated:
+Run the four steps in order to build a comprehensive picture of who depends on the deprecation target:
 
 ```
-Step 1  →  Identify active on-chain callers (EOAs and contracts)
+Step 1  →  Identify active on-chain callers of the function (EOAs and contracts)
 Step 2  →  From the contracts found, confirm which are verified integrators
             and cross-reference with contracts not already in Step 1 results
 Step 3  →  Surface off-chain tooling, SDKs, and upcoming integrations
             not yet visible on-chain
+Step 4  →  If the deprecation target is a CONTRACT ADDRESS (not just a
+            function), find every deployed contract that references it
+            in bytecode, state, or events — independent of whether the
+            reference is currently in use
 ```
 
-The output of Step 1 (a list of counterparty addresses) can inform the `--query` used in Step 2. The results of Step 2 (verified contract addresses and names) can inform GitHub search terms used in Step 3.
+The output of Step 1 (a list of counterparty addresses) can inform the `--query` used in Step 2. The results of Step 2 (verified contract addresses and names) can inform GitHub search terms used in Step 3. Step 4 works independently of the others but pairs well with Step 1: a contract found to reference the target address in Step 4 can be run through Step 1 to see whether it's actively being called on-chain.
